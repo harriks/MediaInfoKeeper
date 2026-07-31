@@ -36,7 +36,6 @@ namespace MediaInfoKeeper.Options.View {
                 EnableInMainMenu = true,
                 DisplayName = "MediaInfoKeeper",
                 MenuIcon = "video_settings",
-                MenuSection = "server",
                 IsMainConfigPage = true
             };
 

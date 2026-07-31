@@ -215,9 +215,9 @@ namespace MediaInfoKeeper.Services {
 
         public bool TryGetCachedDanmuXmlBytes(BaseItem item, out byte[] xmlBytes) {
             xmlBytes = null;
-            if (item == null || !TryBuildSearchRequest(item, out var animeTitle, out var episodeNumber)) return false;
+            if (!TryBuildMatchFileName(item, out var fileName)) return false;
 
-            var cacheKey = BuildSearchCacheKey(animeTitle, episodeNumber);
+            var cacheKey = BuildMatchCacheKey(fileName);
             var cachedXmlBytes = PluginDiskCache.GetBytes(FetchCacheScope, cacheKey, FetchCacheDuration, ".xml");
             if (cachedXmlBytes == null || cachedXmlBytes.Length == 0) return false;
 
@@ -231,14 +231,14 @@ namespace MediaInfoKeeper.Services {
 
             if (item is not Episode && item is not Movie) return new DanmuFetchResult { Reason = "条目类型不支持" };
 
-            if (!TryBuildSearchRequest(item, out var animeTitle, out var episodeNumber))
-                return new DanmuFetchResult { Reason = "无法解析标题或集数" };
+            if (!TryBuildMatchFileName(item, out var fileName))
+                return new DanmuFetchResult { Reason = "无法解析用于匹配的文件名" };
 
             var baseUrl = Plugin.Instance?.Options?.MetaData?.ScrapersEditor?.Danmu?.DanmuApiBaseUrl?.Trim();
             if (TryGetCachedDanmuXmlBytes(item, out var cachedXmlBytes)) return new DanmuFetchResult { XmlBytes = cachedXmlBytes };
 
-            var cacheKey = BuildSearchCacheKey(animeTitle, episodeNumber);
-            var episodeId = await SearchEpisodeIdAsync(baseUrl, animeTitle, episodeNumber, cancellationToken)
+            var cacheKey = BuildMatchCacheKey(fileName);
+            var episodeId = await MatchEpisodeIdAsync(baseUrl, fileName, cancellationToken)
                 .ConfigureAwait(false);
             if (string.IsNullOrWhiteSpace(episodeId)) return new DanmuFetchResult { Reason = "未匹配到条目" };
 
@@ -279,8 +279,8 @@ namespace MediaInfoKeeper.Services {
             return item.FileName ?? item.Path ?? item.Name ?? item.InternalId.ToString();
         }
 
-        private static string BuildSearchCacheKey(string animeTitle, int episodeNumber) {
-            return $"{NormalizeCacheKeyPart(animeTitle)}|{episodeNumber}";
+        private static string BuildMatchCacheKey(string fileName) {
+            return NormalizeCacheKeyPart(fileName);
         }
 
         private static string NormalizeCacheKeyPart(string value) {
@@ -327,26 +327,34 @@ namespace MediaInfoKeeper.Services {
             }
         }
 
-        private async Task<string> SearchEpisodeIdAsync(string baseUrl, string animeTitle, int episodeNumber,
+        private async Task<string> MatchEpisodeIdAsync(string baseUrl, string fileName,
             CancellationToken cancellationToken) {
-            var requestUrl = BuildApiUrl(
-                baseUrl,
-                $"search/episodes?anime={Uri.EscapeDataString(animeTitle)}&episode={episodeNumber}");
+            var requestUrl = BuildApiUrl(baseUrl, "match");
+            var requestBody = JsonSerializer.Serialize(new {
+                matchMode = "fileNameOnly",
+                videoDuration = 0,
+                fileHash = "1a2b3c4d5e6f7890abcdef1234567890",
+                fileName,
+                fileSize = 0
+            });
 
             var requestOptions = new HttpRequestOptions {
                 Url = requestUrl,
                 CancellationToken = cancellationToken,
                 AcceptHeader = "application/json",
+                RequestContent = requestBody.AsMemory(),
+                RequestContentType = "application/json",
                 UserAgent = "MediaInfoKeeper",
-                EnableDefaultUserAgent = false
+                EnableDefaultUserAgent = false,
+                ThrowOnErrorResponse = false
             };
 
-            using var response = await httpClient.SendAsync(requestOptions, "GET").ConfigureAwait(false);
+            using var response = await httpClient.SendAsync(requestOptions, "POST").ConfigureAwait(false);
             var body = await ReadResponseBodyAsync(response).ConfigureAwait(false);
 
             if ((int)response.StatusCode < 200 || (int)response.StatusCode >= 300) {
                 logger.Debug(
-                    $"弹幕下载: 失败 {animeTitle} status={(int)response.StatusCode} url={requestUrl} body={body}");
+                    $"弹幕匹配: 失败 {fileName} status={(int)response.StatusCode} url={requestUrl} body={body}");
                 return null;
             }
 
@@ -354,27 +362,29 @@ namespace MediaInfoKeeper.Services {
 
             try {
                 using var document = JsonDocument.Parse(body);
-                if (!document.RootElement.TryGetProperty("animes", out var animesElement) ||
-                    animesElement.ValueKind != JsonValueKind.Array)
+                var root = document.RootElement;
+                if (!root.TryGetProperty("success", out var successElement) || successElement.ValueKind != JsonValueKind.True)
                     return null;
 
-                foreach (var animeElement in animesElement.EnumerateArray()) {
-                    if (!animeElement.TryGetProperty("episodes", out var episodesElement) ||
-                        episodesElement.ValueKind != JsonValueKind.Array)
-                        continue;
+                if (!root.TryGetProperty("isMatched", out var isMatchedElement) ||
+                    isMatchedElement.ValueKind != JsonValueKind.True)
+                    return null;
 
-                    foreach (var episodeElement in episodesElement.EnumerateArray()) {
-                        if (!episodeElement.TryGetProperty("episodeId", out var episodeIdElement)) continue;
+                if (!root.TryGetProperty("matches", out var matchesElement) ||
+                    matchesElement.ValueKind != JsonValueKind.Array)
+                    return null;
 
-                        var episodeId = episodeIdElement.ValueKind == JsonValueKind.Number
-                            ? episodeIdElement.GetInt64().ToString()
-                            : episodeIdElement.GetString();
-                        if (!string.IsNullOrWhiteSpace(episodeId)) return episodeId;
-                    }
+                foreach (var matchElement in matchesElement.EnumerateArray()) {
+                    if (!matchElement.TryGetProperty("episodeId", out var episodeIdElement)) continue;
+
+                    var episodeId = episodeIdElement.ValueKind == JsonValueKind.Number
+                        ? episodeIdElement.GetInt64().ToString()
+                        : episodeIdElement.GetString();
+                    if (!string.IsNullOrWhiteSpace(episodeId)) return episodeId;
                 }
             }
             catch (Exception ex) {
-                logger.Debug($"弹幕下载: 失败 {animeTitle} 结果解析异常 url={requestUrl}");
+                logger.Debug($"弹幕匹配: 失败 {fileName} 结果解析异常 url={requestUrl}");
                 logger.Debug(ex.Message);
             }
 
@@ -405,33 +415,27 @@ namespace MediaInfoKeeper.Services {
             return memoryStream.ToArray();
         }
 
-        private static bool TryBuildSearchRequest(BaseItem item, out string animeTitle, out int episodeNumber) {
-            animeTitle = null;
-            episodeNumber = 1;
-
+        private static bool TryBuildMatchFileName(BaseItem item, out string fileName) {
+            fileName = null;
             if (item is Episode episode) {
-                animeTitle = ResolveEpisodeTitle(episode);
-                if (!episode.IndexNumber.HasValue || episode.IndexNumber.Value <= 0) return false;
+                var seriesName = episode.SeriesName?.Trim();
+                if (string.IsNullOrWhiteSpace(seriesName)) seriesName = episode.Series?.Name?.Trim();
 
-                episodeNumber = episode.IndexNumber.Value;
-                return !string.IsNullOrWhiteSpace(animeTitle);
+                if (string.IsNullOrWhiteSpace(seriesName) ||
+                    !episode.ParentIndexNumber.HasValue || episode.ParentIndexNumber.Value < 0 ||
+                    !episode.IndexNumber.HasValue || episode.IndexNumber.Value <= 0)
+                    return false;
+
+                fileName = $"{seriesName} S{episode.ParentIndexNumber.Value:D2}E{episode.IndexNumber.Value:D2}";
+                return true;
             }
 
             if (item is Movie movie) {
-                animeTitle = movie.Name?.Trim();
-                return !string.IsNullOrWhiteSpace(animeTitle);
+                fileName = movie.Name?.Trim();
+                return !string.IsNullOrWhiteSpace(fileName);
             }
 
             return false;
-        }
-
-        private static string ResolveEpisodeTitle(Episode item) {
-            if (!string.IsNullOrWhiteSpace(item.SeriesName)) return item.SeriesName.Trim();
-
-            var series = item.Series;
-            if (!string.IsNullOrWhiteSpace(series?.Name)) return series.Name.Trim();
-
-            return item.Name?.Trim();
         }
 
         private static string BuildApiUrl(string baseUrl, string relativePath) {
